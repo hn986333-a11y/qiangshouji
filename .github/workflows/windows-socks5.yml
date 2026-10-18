@@ -21,6 +21,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - uses: Swatinem/rust-cache@v2
       - name: Test and build unsigned Windows installer
         shell: pwsh
         run: ./build-windows.ps1
