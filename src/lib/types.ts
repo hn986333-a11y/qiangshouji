@@ -1,0 +1,434 @@
+/**
+ * 与 Rust 侧一一对应的类型。
+ *
+ * 形状由 `crates/apw-core/tests/wire_format.rs` 钉住 —— 那些用例断言的就是这里
+ * 写的结构。谁改了 Rust 的 serde 标注，那边会先红，而不是等界面上莫名少了一列
+ * 才发现。
+ *
+ * 最关键的是 `Availability`：它在 Rust 里是「未知必然携带原因」的枚举，序列化
+ * 后扁平成两层判别字段。配合下面的穷尽性检查，Rust 那边新增一个状态、这边漏了
+ * 处理就直接编译不过 —— 这条不变量因此从 Rust 一路延伸到了界面上。
+ */
+
+export type UnknownReason =
+  | { reason: "browser_unavailable"; detail: string }
+  | { reason: "not_yet_checked" }
+  | { reason: "pickup_pending" }
+  | { reason: "blocked"; detail: string }
+  | { reason: "rate_limited" }
+  | { reason: "cooling_down"; remaining_seconds: number; detail: string }
+  | { reason: "schema_drift"; field: string; raw: string }
+  | { reason: "no_pickup_data"; store_number: string }
+  | { reason: "store_pickup_unavailable"; store_number: string }
+  | { reason: "product_not_returned"; part_number: string }
+  | { reason: "apple_error"; message: string }
+  | { reason: "transport"; detail: string };
+
+export type Availability =
+  | { kind: "in_stock" }
+  | { kind: "out_of_stock" }
+  | ({ kind: "unknown" } & UnknownReason);
+
+export interface Target {
+  locale: string;
+  storeNumber: string;
+  storeTitle: string;
+  partNumber: string;
+  productName: string;
+  companionPart?: string;
+  companionName?: string;
+  kitPart?: string;
+}
+
+export interface PickupDetails {
+  pickupDisplay: string;
+  pickupQuote: string | null;
+  saleReason: string | null;
+  saleMessage: string | null;
+}
+
+export interface TargetState {
+  target: Target;
+  availability: Availability;
+  pickupDetails?: PickupDetails;
+  lastCheckedMs: number | null;
+  consecutiveFailures: number;
+}
+
+export interface Region {
+  title: string;
+  locale: string;
+}
+
+/** 与 Rust 侧 `model::Category` 一一对应。 */
+export type Category = "iphone" | "ipad" | "mac" | "watch";
+
+/**
+ * 品类选项。
+ *
+ * 由 Rust 侧的 `list_categories` 提供，不在这里另抄一份常量 —— 抄一份就迟早会
+ * 有一边先加了品类、另一边还蒙在鼓里。
+ */
+export interface CategoryOption {
+  value: Category;
+  title: string;
+}
+
+export interface Product {
+  partNumber: string;
+  category: Category;
+  family: string;
+  capacity: string;
+  color: string;
+  title: string;
+  companionPart?: string;
+  kitPart?: string;
+  watchCaseSize?: string;
+}
+
+export interface WatchBandChoice {
+  styleKey: string;
+  styleName: string;
+  colorKey: string;
+  colorName: string;
+}
+
+export interface WatchBandSize {
+  partNumber: string;
+  text: string;
+}
+
+export interface DeliveryRegion {
+  state: string;
+  city: string;
+  district: string;
+}
+
+export interface DeliveryLocalityOption {
+  text: string;
+  value: string;
+}
+
+export interface DeliveryLocalities {
+  states: DeliveryLocalityOption[];
+  cities: DeliveryLocalityOption[];
+  districts: DeliveryLocalityOption[];
+}
+
+export interface Store {
+  number: string;
+  name: string;
+  title: string;
+}
+
+/** 检测到有货时自动打开的页面，与 Rust 侧 `OpenOnHit` 一一对应。 */
+export type OpenOnHit = "none" | "bag" | "education_bag" | "product";
+
+export type NetworkMode = "system" | "pinned" | "clash" | "socks5";
+
+export interface ClashSettings {
+  controller: string;
+  secret: string;
+  group: string;
+  proxyPort: number;
+  /** 节点名关键词，用 | 分隔；为空表示全部节点。 */
+  nodeFilter: string;
+  /** 「指定节点」模式固定使用的节点。 */
+  pinnedNode: string;
+}
+
+export interface NetworkSettings {
+  mode: NetworkMode;
+  clash: ClashSettings;
+  socks5: { nodes: { host: string; port: number; username: string; password: string }[]; selected: number; failover: boolean };
+}
+
+/** 自动结账使用的付款方式，与 Rust 侧 `CheckoutPayment` 一一对应。 */
+export type CheckoutPayment = "alipay" | "wechat" | "installment";
+
+/** Apple 结账页提供的分期期数。 */
+export const INSTALLMENT_PERIODS = [1, 3, 6, 12, 24] as const;
+
+/** 到货后自动结账的设置。目前只支持中国大陆的直营店取货。 */
+export interface CheckoutSettings {
+  enabled: boolean;
+  /** 成功后关闭自动结账；关闭此项允许后续到货继续触发。 */
+  disableAfterSuccess: boolean;
+  /** 自动加入本次到货的型号，允许监控列表中的不同商品触发。 */
+  autoAddToBag: boolean;
+  /** 取货人证件号码后四位；Apple 每次结账都要求重新填写。 */
+  nationalIdSuffix: string;
+  payment: CheckoutPayment;
+  /** 分期方案名称，按结账页上的名称匹配。 */
+  installmentBank: string;
+  installmentPeriods: number;
+  /** 核对通过后是否自动点「立即下单」。 */
+  placeOrder: boolean;
+  /** 结账页默认选中的最近有货门店可取货时直接用它，不换到监控到货的那一家。 */
+  acceptNearestStore: boolean;
+  /** 预先准备购物袋模式的商品标识；自动加购时忽略。 */
+  product: string;
+  /** 是否用下面的联系信息覆盖结账页上 Apple 预填的内容。 */
+  fillContact: boolean;
+  contactLastName: string;
+  contactFirstName: string;
+  contactEmail: string;
+  /** 中国大陆手机号，不带 +86。 */
+  contactPhone: string;
+}
+
+/** 本机 Clash 线路检查结果，不代表 Apple 一定接受这些节点。 */
+export interface ClashRouteCheck {
+  version: string;
+  now: string | null;
+  nodes: string[];
+  skipped: number;
+  portOpen: boolean;
+  /** 批量测速超时的节点数；切换时会逐个复测，超时节点不会被切换过去。 */
+  timeoutCount: number;
+}
+
+/** 一次门店与型号目录刷新的结果。 */
+export interface CatalogRefresh {
+  /** 抓到的型号数（不同零件号）。 */
+  products: number;
+  /** 刷新到的门店数；门店刷新失败时为 null。 */
+  stores: number | null;
+  errors: string[];
+}
+
+/** 专用策略组中的一个节点。 */
+export interface RouteInfo {
+  name: string;
+  /** 批量测速延迟（毫秒）；超时或 DIRECT 为 null。 */
+  delay: number | null;
+  /** 被 Apple 拒绝后冷却中，或暂时连不通。 */
+  resting: boolean;
+}
+
+export interface RouteList {
+  now: string | null;
+  nodes: RouteInfo[];
+}
+
+export interface Settings {
+  locale: string;
+  targets: Target[];
+  deliveryRegion: DeliveryRegion | null;
+  intervalSeconds: number;
+  /** 按商品零件号覆盖默认 Bark；同一型号在不同门店共用。 */
+  productBarkUrls: Record<string, string>;
+  barkUrl: string;
+  soundEnabled: boolean;
+  openOnHit: OpenOnHit;
+  /** 监控到有货后是否暂停监控；关闭时持续有货会每轮重复提醒。 */
+  stopOnHit: boolean;
+  network: NetworkSettings;
+  checkout: CheckoutSettings;
+}
+
+/** 监控目标的唯一键，与 Rust 侧 Target::key 的构成保持一致。 */
+export function targetKey(t: Target): string {
+  return `${t.locale}|${t.storeNumber}|${t.partNumber}`;
+}
+
+/** 一个待安装的更新。 */
+export interface UpdateInfo {
+  version: string;
+  currentVersion: string;
+  notes: string | null;
+}
+
+/**
+ * 遇到故障时用户自己能做什么。与 Rust 侧 `watcher::TroubleAdvice` 一一对应。
+ *
+ * 由引擎判定并传过来，而不是让界面去匹配那句中文里有没有「拦截」两个字 ——
+ * 那种写法在文案改动或加了别的语言之后会静默失效，而且不会有任何东西报错。
+ */
+export type TroubleAdvice =
+  | "try_another_network"
+  | "wait_for_retry"
+  | "wait_for_update"
+  | "check_product";
+
+export interface Trouble {
+  reason: string;
+  advice: TroubleAdvice | null;
+}
+
+export type WatcherEvent =
+  | { type: "stateChanged"; state: TargetState }
+  | { type: "inStock"; state: TargetState }
+  | { type: "cycleStarted"; cycle: number; storeCount: number; targetCount: number }
+  | {
+      type: "cycleComplete";
+      cycle: number;
+      elapsedMs: number;
+      requestCount: number;
+      reusedResponseCount: number;
+      nextCheckInSecs: number;
+      cooling: boolean;
+      /** 本轮使用的出口线路；跟随系统代理时省略。 */
+      route?: string;
+      healthy: boolean;
+      snapshot: TargetState[];
+    }
+  | { type: "trouble"; reason: string; advice: TroubleAdvice | null }
+  | { type: "runStateChanged"; running: boolean };
+
+/** 把建议翻译成一句能照着做的话。 */
+export function describeAdvice(advice: TroubleAdvice): string {
+  switch (advice) {
+    case "try_another_network":
+      return (
+        "Apple 拒绝了这次查询。程序会保留专属后台浏览器会话，且不会自动弹出页面；" +
+        "随后会复用同一会话，按你设置的查询间隔重试，" +
+        "直到手动暂停，不会延长等待；若仍持续失败，再对照官网或切换网络检查。"
+      );
+    case "wait_for_retry":
+      return "程序已暂停当前地区的真实请求，冷却结束后会自动进行一次恢复探测，无需手动重启。";
+    case "wait_for_update":
+      return "返回数据与当前解析规则不一致；如果持续出现，需要进一步排查或更新程序。";
+    case "check_product":
+      return "请刷新型号目录，并核对官网是否仍销售该型号、是否已开放取货。暂无数据不等于无货。";
+    default:
+      return assertNever(advice);
+  }
+}
+
+/** 走到这里说明有分支没处理。放在 `default` 里，漏掉的分支会变成编译错误。 */
+export function assertNever(x: never): never {
+  throw new Error(`未处理的分支：${JSON.stringify(x)}`);
+}
+
+/** 界面上用于区分库存、购买限制及查询进度的语义配色。 */
+export type StatusTone = "inStock" | "outOfStock" | "presale" | "comingSoon" | "pickupUnsupported" | "notForSale" | "unknown" | "pending";
+
+/**
+ * 把状态翻译成展示用的信息。
+ *
+ * 「未知（出故障）」和「待查询」必须分开：前者意味着这一行的数据不可信，
+ * 要用醒目的方式呈现；后者只是还没轮到，弱化即可。上游把这两种和「无货」
+ * 全糊成一种显示，用户无从分辨程序是在正常工作还是已经废了。
+ */
+export function describeAvailability(a: Availability): {
+  label: string;
+  tone: StatusTone;
+  detail: string | null;
+} {
+  switch (a.kind) {
+    case "in_stock":
+      return { label: "有货", tone: "inStock", detail: null };
+    case "out_of_stock":
+      return { label: "无货", tone: "outOfStock", detail: null };
+    case "unknown":
+      return describeUnknown(a);
+    default:
+      return assertNever(a);
+  }
+}
+
+function describeUnknown(a: { kind: "unknown" } & UnknownReason): {
+  label: string;
+  tone: StatusTone;
+  detail: string;
+} {
+  switch (a.reason) {
+    case "not_yet_checked":
+      return { label: "待查询", tone: "pending", detail: "尚未轮到这一项" };
+    case "pickup_pending":
+      return { label: "待开放取货", tone: "comingSoon", detail: "Apple 尚未公布明确的门店取货状态" };
+    case "blocked":
+      return {
+        label: "未知",
+        tone: "unknown",
+        detail: `请求被 Apple 拦截：${compactDiagnostic(a.detail)}`,
+      };
+    case "rate_limited":
+      return {
+        label: "未知",
+        tone: "unknown",
+        detail: "请求过于频繁被限流，正在退避",
+      };
+    case "cooling_down":
+      return {
+        label: "冷却中",
+        tone: "unknown",
+        detail: `约 ${a.remaining_seconds} 秒后自动探测；${a.detail}。当前没有向 Apple 发出请求`,
+      };
+    case "schema_drift":
+      return {
+        label: "未知",
+        tone: "unknown",
+        detail: `接口返回结构与预期不符：${a.field} = ${compactDiagnostic(a.raw)}`,
+      };
+    case "product_not_returned":
+      return { label: "未返回型号", tone: "unknown", detail: "Apple 本次门店响应未包含该 SKU；暂无库存结论，不能视为无货。" };
+    case "no_pickup_data":
+      return { label: "暂无数据", tone: "unknown", detail: "Apple 暂未返回该门店的取货数据；型号可能已下架、尚未开放取货或暂时不可查询，请刷新型号目录并核对官网。" };
+    case "store_pickup_unavailable":
+      return { label: "暂停取货", tone: "comingSoon", detail: "Apple 当前未将该门店接入在线取货；门店可能临时关闭或暂停取货，不能据此判断库存。" };
+    case "apple_error":
+      return { label: "未知", tone: "unknown", detail: `Apple 返回错误：${compactDiagnostic(a.message)}` };
+    case "transport":
+      return { label: "未知", tone: "unknown", detail: describeTransportFailure(a.detail) };
+    case "browser_unavailable":
+      return { label: "浏览器未连接", tone: "unknown", detail: `${compactDiagnostic(a.detail)}。当前库存尚未更新；运行中会按设置的间隔再次尝试连接。` };
+    default:
+      return assertNever(a);
+  }
+}
+
+const MAX_DIAGNOSTIC_CHARS = 160;
+
+/** 防止后端或第三方库把 JSON、对象 ID、堆栈等调试信息直接铺进用户界面。 */
+function compactDiagnostic(raw: string): string {
+  const normalized = raw.replace(/\s+/g, " ").trim();
+  if (
+    normalized.includes("exceptionDetails") ||
+    normalized.includes('"className"') ||
+    normalized.includes('"objectId"') ||
+    normalized.includes('"stackTrace"')
+  ) {
+    return "返回了不可读的诊断信息";
+  }
+  if (normalized.length <= MAX_DIAGNOSTIC_CHARS) return normalized;
+  return `${normalized.slice(0, MAX_DIAGNOSTIC_CHARS)}…`;
+}
+
+function describeTransportFailure(raw: string): string {
+  const detail = compactDiagnostic(raw);
+  const lower = raw.toLowerCase();
+  if (
+    detail.includes("浏览器安全限制") ||
+    lower.includes("access is denied") ||
+    lower.includes("domexception")
+  ) {
+    return "浏览器安全限制阻止了本次 Apple 页面访问，程序将在下一轮自动重试";
+  }
+  if (lower.includes("chromium") && lower.includes("超时")) {
+    return `${detail || "等待 Apple 页面响应超时"}，程序将在下一轮按设置的间隔自动重试`;
+  }
+  if (lower.includes("chromium") || lower.includes("浏览器")) {
+    return `${detail || "浏览器会话未能完成本次 Apple 查询"}，程序将在下一轮按设置的间隔自动重试`;
+  }
+  if (detail.includes("Apple 页面请求失败")) {
+    return `${detail}，本轮不更新该门店；程序将在下一轮按设置的间隔自动重试`;
+  }
+  return `网络请求失败：${detail || "暂时无法连接 Apple"}，程序将在下一轮自动重试`;
+}
+
+/** 这一行的数据是否已经不可信。 */
+export function isUntrusted(a: Availability): boolean {
+  return a.kind === "unknown"
+    && a.reason !== "not_yet_checked"
+    && a.reason !== "pickup_pending"
+    && a.reason !== "store_pickup_unavailable";
+}
+
+export function formatTime(ms: number | null): string {
+  if (ms === null) return "—";
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}

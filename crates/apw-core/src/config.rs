@@ -1,0 +1,1199 @@
+//! 用户设置的读写。
+//!
+//! 这个模块只跟磁盘打交道，不认识网络也不认识界面。
+//!
+//! # 为什么「读不出来」必须是错误，而不是「返回默认值」
+//!
+//! 这是整个模块最容易写错、后果也最重的一处。[`SettingsStore::load`] 只在
+//! **文件确实不存在**时才回退到默认设置；文件存在但读不动、超限、或解析不了，
+//! 一律返回 [`ConfigError`]。
+//!
+//! 区分这两者不是洁癖：调用方拿到默认设置会照常继续，并在用户改动任何一项时
+//! 写盘 —— 而那份盘上原本躺着用户攒了很久的监控列表。如果「读失败」也返回默认值，
+//! 程序启动后几毫秒内就会用一份空配置覆盖掉唯一的那份，用户全程看不到任何提示。
+//! 正确的处置是：拿到错误 → 放弃写盘 → 用 [`SettingsStore::preserve_corrupted`]
+//! 把原文件改名留档 → 告诉用户档案在哪。
+//!
+//! 这和 [`crate::model::Availability`] 守的是同一条线：**「不知道」不能被折叠成
+//! 一个看起来正常的值。**
+
+use std::collections::{BTreeMap, HashSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+use serde::{Deserialize, Serialize};
+
+use crate::model::{DeliveryRegion, REGIONS, Target, region_by_locale};
+
+/// 检测到有货时自动打开的 Apple 页面。
+///
+/// 反序列化同时接受旧版的布尔值：`true` 表示购物袋，`false` 表示不自动打开。
+/// 这样升级不会悄悄改变现有用户的跳转习惯。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenOnHit {
+    None,
+    #[default]
+    Bag,
+    EducationBag,
+    Product,
+}
+
+impl<'de> Deserialize<'de> for OpenOnHit {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Current {
+            None,
+            Bag,
+            EducationBag,
+            Product,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Wire {
+            Legacy(bool),
+            Current(Current),
+        }
+
+        Ok(match Wire::deserialize(deserializer)? {
+            Wire::Legacy(true) | Wire::Current(Current::Bag) => Self::Bag,
+            Wire::Legacy(false) | Wire::Current(Current::None) => Self::None,
+            Wire::Current(Current::EducationBag) => Self::EducationBag,
+            Wire::Current(Current::Product) => Self::Product,
+        })
+    }
+}
+
+/// 默认查询间隔（秒）。
+///
+/// 上游写死 500 毫秒一轮，即每个门店每秒两次请求。这个频率对一个公开的商品
+/// 查询接口来说过高，是触发风控的直接原因，也是上游 issue 里 503 / 541 反复
+/// 出现的背景。30 秒足够应付抢购，同时不会把自己送进黑名单。
+pub const DEFAULT_INTERVAL_SECONDS: u64 = 30;
+
+/// 允许设置的间隔下限（秒）。保留手动调快的余地，但不允许低到必然触发风控。
+pub const MIN_INTERVAL_SECONDS: u64 = 5;
+
+/// 读取设置文件时接受的字节上限。
+///
+/// 一份正常配置只有几百字节，单条 [`Target`] 序列化后不到 200 字节，登记上千个
+/// 目标也才几百 KB，1 MiB 是数量级上的余量。之所以必须有上限：Go 版用
+/// `os.ReadFile` 整读，磁盘损坏、别的程序写错了文件、或有人刻意构造一个几 GB 的
+/// settings.json 时，内存会在任何错误处理之前就被吃光，进程直接被杀 —— 用户连
+/// 「配置读不出来」这句提示都看不到，更谈不上留档。
+pub const MAX_SETTINGS_BYTES: usize = 1 << 20;
+
+/// 配置目录名，位于系统约定的用户配置目录之下。
+///
+/// 上游把 `user_settings.json` 直接写在进程工作目录。打包成 macOS `.app` 之后，
+/// 工作目录取决于应用被如何启动，可能是 `/` 这种不可写的位置，设置会静默丢失。
+const APP_DIR: &str = "apple-store-inventory-monitor";
+
+/// 改名前版本使用的配置目录。只用于首次迁移，不会写入或删除。
+const PREVIOUS_APP_DIR: &str = "apple-pickup-watcher";
+
+/// 新版设置文件名。
+///
+/// **刻意不沿用 Go 版的 `settings.json`。** 两版的字段命名不同（Go 版是
+/// snake_case，这里是 camelCase，见 [`Settings`] 的 serde 标注），共用一个文件名
+/// 会让两个版本互相把对方的配置读成一堆缺省值再覆盖掉。分成两个文件之后：
+/// 新版首次启动可以用 [`SettingsStore::import_legacy`] 把旧配置读过来，
+/// 用户想退回 Go 版时那份 `settings.json` 也还原封不动地在。
+const SETTINGS_FILE: &str = "settings.v2.json";
+
+/// Go 版留下的设置文件名，只读不写。
+const LEGACY_SETTINGS_FILE: &str = "settings.json";
+
+/// 设置读写过程中的失败。
+///
+/// 变体分得这么细，是因为调用方要据此给出不同的提示：「文件大得离谱」和
+/// 「JSON 坏了」对用户意味着完全不同的事情。至于**处置**方式三者是一致的 ——
+/// 都属于「读不到旧配置」，都必须放弃写盘并把原文件留档。
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// 系统没有给出用户配置目录的位置。
+    #[error("定位用户配置目录失败：系统未提供配置目录位置")]
+    NoConfigDir,
+
+    /// 文件系统操作失败。
+    #[error("{action} {} 失败：{source}", .path.display())]
+    Io {
+        /// 正在做的事，用于拼出一句人话，如「打开设置文件」。
+        action: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// 设置文件超过 [`MAX_SETTINGS_BYTES`]。
+    ///
+    /// 单独一个变体，好让调用方能用 `matches!` 把它和「JSON 坏了」区分开。
+    #[error("设置文件 {} 超过 {limit} 字节上限", .path.display())]
+    TooLarge { path: PathBuf, limit: usize },
+
+    /// 文件读到了，但内容不是一份能解析的设置。
+    #[error("解析设置文件 {} 失败：{source}", .path.display())]
+    Malformed {
+        path: PathBuf,
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// 把设置序列化成 JSON 失败。
+    #[error("序列化设置失败：{source}")]
+    Encode {
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+impl ConfigError {
+    fn io(action: &'static str, path: impl Into<PathBuf>, source: std::io::Error) -> Self {
+        Self::Io {
+            action,
+            path: path.into(),
+            source,
+        }
+    }
+}
+
+/// Apple 查询使用的出口线路。
+///
+/// 默认跟随系统代理，与引入线路设置之前的行为完全一致：已有用户升级后不会
+/// 悄悄换一条出口。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkMode {
+    /// 不给查询浏览器指定代理，由系统代理设置决定出口。
+    #[default]
+    System,
+    Socks5,
+    /// 通过 Clash / mihomo 的专用端口，固定使用 `pinned_node`，不自动切换。
+    ///
+    /// 选 DIRECT 时经 Clash 直连出去。即使 Clash 开着 TUN 也能真正用上本机
+    /// 网络，这是只给浏览器加 `--no-proxy-server` 做不到的。
+    Pinned,
+    /// 通过 Clash / mihomo 的专用端口查询，被拦时经控制接口切换节点。
+    Clash,
+}
+
+/// Clash / mihomo 线路设置。
+///
+/// 应用只切换 `group` 这一个策略组的节点，并且只让查询浏览器走 `proxy_port`。
+/// 这要求用户为果到雷达单独配置策略组和监听端口，切换节点才不会改变电脑上
+/// 其他软件的代理出口。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ClashSettings {
+    /// 外部控制接口地址，例如 `http://127.0.0.1:9097`。
+    pub controller: String,
+    /// 外部控制接口密钥，可为空。
+    pub secret: String,
+    /// 专用 select 策略组名。
+    pub group: String,
+    /// 只转发到 `group` 的本机代理端口。
+    pub proxy_port: u16,
+    /// 节点名关键词，用 `|` 分隔；为空表示使用组内全部节点。
+    pub node_filter: String,
+    /// 「指定节点」模式固定使用的节点。
+    pub pinned_node: String,
+}
+
+impl Default for ClashSettings {
+    fn default() -> Self {
+        Self {
+            controller: "http://127.0.0.1:9097".into(),
+            secret: String::new(),
+            group: "果到雷达".into(),
+            proxy_port: 7899,
+            node_filter: String::new(),
+            pinned_node: "DIRECT".into(),
+        }
+    }
+}
+
+/// 内置 SOCKS5；密码按原有配置机制保存在本机，日志不得输出此结构。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SocksSettings {
+    pub nodes: Vec<SocksNode>,
+    pub selected: usize,
+    pub failover: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocksNode {
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for SocksNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SocksNode([redacted])")
+    }
+}
+
+/// 查询网络设置。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct NetworkSettings {
+    pub mode: NetworkMode,
+    pub clash: ClashSettings,
+    pub socks5: SocksSettings,
+}
+
+impl NetworkSettings {
+    fn normalize(&mut self) {
+        let clash = &mut self.clash;
+        clash.controller = clash.controller.trim().trim_end_matches('/').to_string();
+        // Clash 界面显示的监听地址不带协议（如 127.0.0.1:9097），用户会直接照抄。
+        if !clash.controller.is_empty() && !clash.controller.contains("://") {
+            clash.controller = format!("http://{}", clash.controller);
+        }
+        clash.secret = clash.secret.trim().to_string();
+        clash.group = clash.group.trim().to_string();
+        clash.node_filter = clash.node_filter.trim().to_string();
+        clash.pinned_node = clash.pinned_node.trim().to_string();
+        if clash.pinned_node.is_empty() {
+            clash.pinned_node = "DIRECT".into();
+        }
+    }
+}
+
+/// 自动下单使用的付款方式。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckoutPayment {
+    #[default]
+    Alipay,
+    Wechat,
+    /// 银行或平台分期，具体方案由 `installment_bank` 与 `installment_periods` 决定。
+    Installment,
+}
+
+/// Apple 结账页提供的分期期数。
+pub const INSTALLMENT_PERIODS: [u8; 5] = [1, 3, 6, 12, 24];
+
+/// 自动结账目前只支持中国大陆的结账页，其他地区的页面结构没有验证过。
+pub const CHECKOUT_LOCALE: &str = "zh_CN";
+
+/// 自动结账用来区分「是不是同一件商品」的标识。
+///
+/// 同一件商品可以在多家门店各有一条监控项，它们的标识相同。Watch 的表壳要搭配
+/// 表带，所以搭配件也算进去。前端按同样的规则拼这个字符串，两边必须一致。
+pub fn checkout_product_key(target: &Target) -> String {
+    format!(
+        "{}|{}|{}",
+        target.part_number,
+        target.companion_part.as_deref().unwrap_or_default(),
+        target.kit_part.as_deref().unwrap_or_default()
+    )
+}
+
+/// 到货后自动结账的设置。目前只支持中国大陆的直营店取货。
+///
+/// 默认整体关闭；即使开启，也默认停在「查看订单」页由用户自己点「立即下单」。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CheckoutSettings {
+    pub enabled: bool,
+    /// 成功后是否关闭自动结账。旧配置保持原来的单次行为。
+    pub disable_after_success: bool,
+    /// 按本次到货的型号自动加购；开启后，所有中国大陆监控型号均可触发。
+    /// 旧配置保持关闭，继续使用预先准备的购物袋和指定商品。
+    pub auto_add_to_bag: bool,
+    /// 取货人证件号码后四位。Apple 每次结账都要求重新填写，不会预填。
+    pub national_id_suffix: String,
+    pub payment: CheckoutPayment,
+    /// 分期方案名称，按结账页上的名称匹配，例如「招商银行」「花呗分期」。
+    pub installment_bank: String,
+    pub installment_periods: u8,
+    /// 核对通过后是否自动点「立即下单」。付款始终由用户自己完成。
+    pub place_order: bool,
+    /// 结账页默认选中的门店（离取货地区最近的有货门店）可取货时，直接在那里取货，
+    /// 即使它不是监控到货的那一家。换门店要多等 Apple 一轮加载，约十几秒。
+    pub accept_nearest_store: bool,
+    /// 预先准备购物袋模式的指定商品（[`checkout_product_key`]）。自动加购时忽略，
+    /// 否则只有它到货才触发。留空且只有一种商品时自动认定为那一件。
+    pub product: String,
+    /// 是否用下面这组联系信息覆盖结账页上 Apple 预填的内容。关闭时只核对预填内容。
+    pub fill_contact: bool,
+    /// 取货人姓名须与取货时出示的证件一致。留空的项不填，沿用页面上已有的值。
+    pub contact_last_name: String,
+    pub contact_first_name: String,
+    pub contact_email: String,
+    /// 中国大陆手机号，不带 +86。
+    pub contact_phone: String,
+}
+
+impl Default for CheckoutSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            disable_after_success: true,
+            auto_add_to_bag: false,
+            national_id_suffix: String::new(),
+            payment: CheckoutPayment::Alipay,
+            installment_bank: "招商银行".into(),
+            installment_periods: 24,
+            place_order: false,
+            accept_nearest_store: false,
+            product: String::new(),
+            fill_contact: false,
+            contact_last_name: String::new(),
+            contact_first_name: String::new(),
+            contact_email: String::new(),
+            contact_phone: String::new(),
+        }
+    }
+}
+
+impl CheckoutSettings {
+    fn normalize(&mut self) {
+        // 身份证末位可能是 X；港澳台通行证与护照号也只含字母数字。
+        self.national_id_suffix = self
+            .national_id_suffix
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_uppercase())
+            .take(4)
+            .collect();
+        self.installment_bank = self.installment_bank.trim().to_string();
+        self.contact_last_name = self.contact_last_name.trim().to_string();
+        self.contact_first_name = self.contact_first_name.trim().to_string();
+        self.contact_email = self.contact_email.trim().to_string();
+        // 结账页的区号是固定的 +86，输入框里只要号码本身。
+        let digits: String = self
+            .contact_phone
+            .chars()
+            .filter(char::is_ascii_digit)
+            .collect();
+        self.contact_phone = match digits.strip_prefix("86") {
+            Some(rest) if rest.len() == 11 => rest.to_string(),
+            _ => digits,
+        };
+        if !INSTALLMENT_PERIODS.contains(&self.installment_periods) {
+            self.installment_periods = 24;
+        }
+        // 花呗分期最多 12 期，结账页上没有 24 期这个选项。
+        if self.installment_bank == "花呗分期" && self.installment_periods > 12 {
+            self.installment_periods = 12;
+        }
+    }
+
+    /// 证件后四位是否已填完整。没填完时自动结账必然卡在取货信息页。
+    pub fn has_national_id_suffix(&self) -> bool {
+        self.national_id_suffix.chars().count() == 4
+    }
+}
+
+/// 持久化的用户设置。
+///
+/// 字段名跨 IPC 边界要和前端对齐，所以统一小驼峰，与 [`Target`]、
+/// [`crate::model::Product`] 等类型一致。
+///
+/// 容器级 `#[serde(default)]` 是有意加的：磁盘上的文件可能来自旧版本、少几个
+/// 字段。缺字段应当取**默认值**，而不是取该类型的零值 —— 否则一份老配置读上来
+/// 会把 `soundEnabled` 变成 `false`，用户什么都没改，提示音却自己关了。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Settings {
+    /// 上次选择的地区 locale。
+    pub locale: String,
+    /// 监控目标列表。
+    pub targets: Vec<Target>,
+    /// 统一的送货目的地区。为空时保留 Apple 按门店地区给出的估算。
+    pub delivery_region: Option<DeliveryRegion>,
+    /// 每轮查询之间的间隔秒数。
+    pub interval_seconds: u64,
+    /// 为空表示不启用 Bark 推送。
+    pub bark_url: String,
+    /// 按商品零件号覆盖默认 Bark；同一型号在不同门店共用一条路由。
+    pub product_bark_urls: BTreeMap<String, String>,
+    /// 有货时是否播放提示音。
+    pub sound_enabled: bool,
+    /// 有货时自动打开的页面；旧字段 `openBagOnHit` 通过别名兼容。
+    #[serde(alias = "openBagOnHit")]
+    pub open_on_hit: OpenOnHit,
+    /// 监控到任意一条有货后是否暂停监控。关闭时只要持续有货，每一轮都会重新提醒
+    /// （并重新触发自动结账）。
+    pub stop_on_hit: bool,
+    /// Apple 查询的出口线路。
+    pub network: NetworkSettings,
+    /// 到货后自动结账。
+    pub checkout: CheckoutSettings,
+}
+
+/// 内置地区表里的第一个 locale，作为兜底取值。
+///
+/// 不写 `REGIONS[0]`：那是个会 panic 的下标访问，而这是库代码。
+fn fallback_locale() -> &'static str {
+    REGIONS.first().map_or("zh_CN", |r| r.locale)
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            locale: fallback_locale().to_string(),
+            targets: Vec::new(),
+            delivery_region: None,
+            interval_seconds: DEFAULT_INTERVAL_SECONDS,
+            bark_url: String::new(),
+            product_bark_urls: BTreeMap::new(),
+            sound_enabled: true,
+            open_on_hit: OpenOnHit::Bag,
+            stop_on_hit: false,
+            network: NetworkSettings::default(),
+            checkout: CheckoutSettings::default(),
+        }
+    }
+}
+
+impl Settings {
+    /// 修正越界或非法的字段，使设置始终可用。
+    ///
+    /// 这里只做「收敛」，不做「丢弃用户意图」：认不出的 locale 换成默认地区、
+    /// 过小的间隔拉回默认值、重复的目标去掉。真正被丢掉的只有结构上就发不出
+    /// 请求的目标（地区/门店/零件号为空），它们留着也只会在界面上永远显示未知。
+    pub fn normalize(&mut self) {
+        if region_by_locale(&self.locale).is_none() {
+            self.locale = fallback_locale().to_string();
+        }
+
+        self.delivery_region = self
+            .delivery_region
+            .as_ref()
+            .and_then(DeliveryRegion::normalized);
+
+        // 注意是「小于下限就回到默认值」，不是「夹到下限」。手抖填了 1 秒的人
+        // 想要的是快，但 5 秒同样会被风控盯上；退回 30 秒才是安全的那一侧。
+        if self.interval_seconds < MIN_INTERVAL_SECONDS {
+            self.interval_seconds = DEFAULT_INTERVAL_SECONDS;
+        }
+
+        // 去重时**新建 Vec 再整体替换**，不在原 Vec 上就地压缩。
+        //
+        // Go 版写的是 kept := s.Targets[:0]，复用底层数组原地压缩。而 Save 虽然
+        // 按值收 Settings，Targets 却和调用方共用同一块数组：调用方持有
+        // [A, A, B] 时，去重结果 [A, B] 会把底层数组改成 [A, B, B]，调用方那个
+        // 切片长度仍是 3 —— 内容悄悄从 [A, A, B] 变成了 [A, B, B]，于是
+        // 「改设置 → 保存 → 把 targets 交给引擎」这条路径会莫名多出一条重复行。
+        //
+        // Rust 的 Vec 是独占所有权的，retain 串不到别人身上；真正的防线在
+        // [`SettingsStore::save`] 的签名上：它收 &Settings，规范化只发生在自己的
+        // 副本上，编译器保证调用方那份数据一个字节都不会被动。
+        let mut kept: Vec<Target> = Vec::with_capacity(self.targets.len());
+        let mut seen: std::collections::HashSet<crate::model::TargetKey> =
+            std::collections::HashSet::with_capacity(self.targets.len());
+        for t in &self.targets {
+            // 用 trim 判空：手工编辑过的文件里全是空格的字段和空字符串一样发不出请求。
+            if t.locale.trim().is_empty()
+                || t.store_number.trim().is_empty()
+                || t.part_number.trim().is_empty()
+            {
+                continue;
+            }
+            if seen.insert(t.key()) {
+                kept.push(t.clone());
+            }
+        }
+        self.targets = kept;
+
+        // 型号专属 Bark 只保留仍在监控的型号。地址在保存时统一去掉首尾空白，
+        // 空值等价于「沿用默认 Bark」，不必在配置文件里留一条无效覆盖。
+        let active_parts: HashSet<String> = self
+            .targets
+            .iter()
+            .map(|target| target.part_number.clone())
+            .collect();
+        self.product_bark_urls.retain(|part_number, bark_url| {
+            *bark_url = bark_url.trim().to_string();
+            active_parts.contains(part_number) && !bark_url.is_empty()
+        });
+
+        self.network.normalize();
+        self.checkout.normalize();
+        // 旧模式仍要求明确的单商品；自动加购模式由每次到货的目标决定商品。
+        if !self.checkout.auto_add_to_bag
+            && !self.checkout.product.is_empty()
+            && !self.checkout_candidates().contains(&self.checkout.product)
+        {
+            self.checkout.product.clear();
+            // 选定的商品没了就整体停用，不让剩下的某一件悄悄顶替它继续自动下单。
+            self.checkout.enabled = false;
+        }
+        if !self
+            .targets
+            .iter()
+            .any(|target| self.is_checkout_target(target))
+        {
+            self.checkout.enabled = false;
+        }
+    }
+
+    /// 监控列表里可以自动结账的不同商品，按出现顺序排列。
+    fn checkout_candidates(&self) -> Vec<String> {
+        let mut keys: Vec<String> = Vec::new();
+        for target in &self.targets {
+            if target.locale != CHECKOUT_LOCALE {
+                continue;
+            }
+            let key = checkout_product_key(target);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        keys
+    }
+
+    /// 自动结账要下单的商品：用户选中的那件；没选但监控列表里只有一件时就是它。
+    pub fn checkout_product(&self) -> Option<String> {
+        let mut candidates = self.checkout_candidates();
+        if candidates.contains(&self.checkout.product) {
+            return Some(self.checkout.product.clone());
+        }
+        if candidates.len() == 1 {
+            return candidates.pop();
+        }
+        None
+    }
+
+    /// 这条监控项到货时是否应当触发自动结账。
+    pub fn is_checkout_target(&self, target: &Target) -> bool {
+        target.locale == CHECKOUT_LOCALE
+            && (self.checkout.auto_add_to_bag
+                || self.checkout_product().as_deref()
+                    == Some(checkout_product_key(target).as_str()))
+    }
+
+    /// 查询间隔。
+    pub fn interval(&self) -> Duration {
+        Duration::from_secs(self.interval_seconds)
+    }
+
+    /// 返回某个型号实际使用的 Bark 地址：专属地址优先，否则沿用默认地址。
+    pub fn bark_url_for(&self, target: &Target) -> &str {
+        self.product_bark_urls
+            .get(&target.part_number)
+            .map_or(self.bark_url.as_str(), String::as_str)
+    }
+}
+
+/// 设置文件的读写入口。
+///
+/// 没有像 Go 版那样带一把互斥锁，因为这里根本不需要：每次写盘都用一个独立命名的
+/// 临时文件，最后一步 `rename` 是原子的，并发写入最坏也只是后到的那份胜出，
+/// 绝不会出现两份内容交织在一起的文件。反过来说，Go 那把进程内的锁本来也挡不住
+/// 第二个进程或第二份安装同时写。
+#[derive(Debug, Clone)]
+pub struct SettingsStore {
+    path: PathBuf,
+    previous_path: Option<PathBuf>,
+}
+
+impl SettingsStore {
+    /// 指向系统用户配置目录下的设置文件。
+    ///
+    /// **只算路径，不碰磁盘。** 构造一个 Store 是个纯粹的内存操作，不该在用户
+    /// 机器上留下痕迹 —— 目录会在 [`save`](Self::save) 真正写盘时才创建。这样
+    /// 「程序启动了但用户什么都没设置」的情况下，配置目录始终是干净的。
+    pub fn new() -> Result<Self, ConfigError> {
+        let dir = dirs::config_dir().ok_or(ConfigError::NoConfigDir)?;
+        Ok(Self {
+            path: dir.join(APP_DIR).join(SETTINGS_FILE),
+            previous_path: Some(dir.join(PREVIOUS_APP_DIR).join(SETTINGS_FILE)),
+        })
+    }
+
+    /// 指向任意路径，供测试使用。
+    pub fn at(path: PathBuf) -> Self {
+        Self {
+            path,
+            previous_path: None,
+        }
+    }
+
+    /// 设置文件的完整路径，便于在界面上告诉用户配置存在哪。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 首次启动新包时读取改名前版本的 v2 设置。
+    ///
+    /// 旧文件保持原样，只把解析出的设置交给调用方写入新目录。这样新旧安装包
+    /// 拥有完全不同的配置身份，同时用户现有的监控列表和提醒选项不会丢失。
+    pub fn import_previous_version(&self) -> Option<Settings> {
+        let path = self.previous_path.as_ref()?;
+        let file = File::open(path).ok()?;
+        let data = read_capped(file, MAX_SETTINGS_BYTES).ok()??;
+        let mut settings: Settings = serde_json::from_slice(&data).ok()?;
+        settings.normalize();
+        Some(settings)
+    }
+
+    /// 读取设置。
+    ///
+    /// **文件不存在**返回默认设置且不算错误；文件存在却读不出来一律返回错误。
+    /// 这个区分是刻意的，理由见模块文档。
+    pub fn load(&self) -> Result<Settings, ConfigError> {
+        harden_existing_config(&self.path)?;
+        let file = match File::open(&self.path) {
+            Ok(f) => f,
+            // 只有「确实没有这个文件」才等于「用户还没有配置」。
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Settings::default()),
+            Err(source) => {
+                return Err(ConfigError::io("打开设置文件", &self.path, source));
+            }
+        };
+
+        let data = read_capped(file, MAX_SETTINGS_BYTES)
+            .map_err(|source| ConfigError::io("读取设置文件", &self.path, source))?
+            .ok_or_else(|| ConfigError::TooLarge {
+                path: self.path.clone(),
+                limit: MAX_SETTINGS_BYTES,
+            })?;
+
+        let mut settings: Settings =
+            serde_json::from_slice(&data).map_err(|source| ConfigError::Malformed {
+                path: self.path.clone(),
+                source,
+            })?;
+        settings.normalize();
+        Ok(settings)
+    }
+
+    /// 原子地写入设置。
+    ///
+    /// 收 `&Settings` 而不是 `&mut Settings`：规范化只发生在内部的副本上，
+    /// 调用方手里那份不会被动。见 [`Settings::normalize`] 里的说明。
+    pub fn save(&self, settings: &Settings) -> Result<(), ConfigError> {
+        let mut normalized = settings.clone();
+        normalized.normalize();
+
+        let data = serde_json::to_vec_pretty(&normalized)
+            .map_err(|source| ConfigError::Encode { source })?;
+
+        write_atomically(&self.path, &data)
+    }
+
+    /// 把当前这份读不出来的设置文件改名留档，返回留档路径；
+    /// 本来就没有文件时返回 `Ok(None)`。
+    ///
+    /// [`load`](Self::load) 失败之后调用方会放弃写盘，但光是不写还不够：用户
+    /// 之后可能想把里面的监控列表捞回来，或者需要这份文件来判断到底哪里坏了。
+    ///
+    /// 用改名而不是复制，是因为读失败的情形（权限不足、IO 错误）下未必读得动，
+    /// 而改名只需要目录的写权限。
+    pub fn preserve_corrupted(&self) -> Result<Option<PathBuf>, ConfigError> {
+        // 用 symlink_metadata 而不是 metadata：指向不存在目标的符号链接同样是
+        // 「这里有个文件挡着」，也同样需要挪开，不该被当成「本来就没有文件」。
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(source) => return Err(ConfigError::io("检查设置文件", &self.path, source)),
+        }
+
+        let backup = self.backup_path();
+        fs::rename(&self.path, &backup)
+            .map_err(|source| ConfigError::io("留档损坏的设置文件", &self.path, source))?;
+        Ok(Some(backup))
+    }
+
+    /// 挑一个还没被占用的留档路径。
+    ///
+    /// 只挑名字、不预先创建，随后的 rename 才是真正的落地动作。同一秒内连续
+    /// 留档两次也不会互相覆盖 —— 覆盖掉的正是用户最想留住的那份。
+    fn backup_path(&self) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let name = self
+            .path
+            .file_name()
+            .map_or_else(|| SETTINGS_FILE.to_string(), |n| n.to_string_lossy().into());
+        let dir = parent_dir(&self.path);
+
+        let mut candidate = dir.join(format!("{name}.corrupt-{stamp}"));
+        let mut seq = 1u32;
+        while candidate.symlink_metadata().is_ok() {
+            candidate = dir.join(format!("{name}.corrupt-{stamp}-{seq}"));
+            seq = seq.saturating_add(1);
+        }
+        candidate
+    }
+
+    /// 尝试读取 Go 版留下的设置并转换过来，供首次启动时平滑迁移。
+    ///
+    /// 调用方应当只在 [`load`](Self::load) 表明「新版文件还不存在」时才调用它，
+    /// 否则会用旧配置盖掉新配置。
+    ///
+    /// 返回 `Option` 而不是 `Result` 是刻意的：迁移是锦上添花。旧文件不在、
+    /// 读不动、格式对不上……任何一种情况都只意味着「没有可迁移的东西」，
+    /// 绝不能因此让程序起不来，也不值得为它弹一个用户看不懂的错误。
+    pub fn import_legacy(&self) -> Option<Settings> {
+        let current_legacy = parent_dir(&self.path).join(LEGACY_SETTINGS_FILE);
+        let previous_legacy = self
+            .previous_path
+            .as_ref()
+            .map(|path| parent_dir(path).join(LEGACY_SETTINGS_FILE));
+
+        std::iter::once(current_legacy)
+            .chain(previous_legacy)
+            .filter(|path| path != &self.path)
+            .find_map(|path| {
+                let file = File::open(path).ok()?;
+                // 旧文件同样要限量读：它会撑爆内存的理由与新文件完全相同，
+                // 没道理在迁移路径上开口子。
+                let data = read_capped(file, MAX_SETTINGS_BYTES).ok()??;
+                let legacy: LegacySettings = serde_json::from_slice(&data).ok()?;
+                Some(legacy.into_settings())
+            })
+    }
+}
+
+/// 取文件所在目录；路径本身就是个裸文件名时退回当前目录。
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// 至多读 `limit + 1` 字节。读满 `limit + 1` 说明内容确实超限，返回 `Ok(None)`。
+///
+/// 多读一个字节是为了在**不整读**的前提下判定超限：只读 `limit` 字节的话，
+/// 恰好读满时分不清「文件正好这么大」还是「后面还有几个 GB」。
+///
+/// 关键在于内存占用被这个上限钉死了，与文件实际大小无关 —— 这正是 Go 版
+/// `os.ReadFile` 缺的那一环。
+fn read_capped<R: Read>(reader: R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    let mut capped = reader.take(limit as u64 + 1);
+    capped.read_to_end(&mut buf)?;
+    if buf.len() > limit {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
+
+/// 临时文件名的进程内序号，保证同一进程并发写盘时不会撞名。
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// 临时文件守卫：只要没被 [`TempFile::disarm`]，离开作用域就把它删掉。
+///
+/// 有了它，写入过程中任何一步出错都不会在配置目录里留下垃圾，而不必在每条
+/// 失败分支上手写一遍清理 —— 手写的那种迟早会漏一条。
+struct TempFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFile {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        if self.armed {
+            // 清理失败也没什么可做的，更不该在析构里制造新的失败。
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// 在 `dir` 下独占地创建一个临时文件。
+///
+/// 用 `create_new`：如果重名的文件已经存在（另一个进程正在写、或上一次崩溃留下的
+/// 残骸），必须换个名字重来，绝不能截断别人的文件。
+fn create_temp_file(dir: &Path) -> Result<(TempFile, File), ConfigError> {
+    let mut last: Option<std::io::Error> = None;
+    for _ in 0..32 {
+        let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = dir.join(format!(".apw-settings-{}-{seq}.tmp", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&candidate) {
+            Ok(file) => {
+                return Ok((
+                    TempFile {
+                        path: candidate,
+                        armed: true,
+                    },
+                    file,
+                ));
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(ConfigError::io("创建临时文件于", dir, e)),
+        }
+    }
+    let source =
+        last.unwrap_or_else(|| std::io::Error::new(ErrorKind::AlreadyExists, "临时文件名反复冲突"));
+    Err(ConfigError::io("创建临时文件于", dir, source))
+}
+
+/// 先写临时文件、刷盘、再改名。
+///
+/// 直接往目标文件上写的话，写到一半崩溃或断电就会留下半截 JSON，下次启动直接
+/// 解析失败 —— 用户的监控列表就这么没了。改名在同一个文件系统内是原子的：
+/// 任何时刻去读，看到的要么是完整的旧内容，要么是完整的新内容。
+fn write_atomically(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
+    let dir = parent_dir(path);
+    fs::create_dir_all(dir).map_err(|e| ConfigError::io("创建配置目录", dir, e))?;
+    harden_config_dir(dir)?;
+
+    let (mut guard, mut file) = create_temp_file(dir)?;
+
+    file.write_all(data)
+        .map_err(|e| ConfigError::io("写入临时文件", &guard.path, e))?;
+    // 必须在改名前刷盘。只改名不刷盘的话，掉电后可能出现「名字换好了、内容还在
+    // 页缓存里没落地」，结果是一个大小为 0 的设置文件 —— 比半截 JSON 还糟。
+    file.sync_all()
+        .map_err(|e| ConfigError::io("刷盘临时文件", &guard.path, e))?;
+    drop(file);
+
+    fs::rename(&guard.path, path).map_err(|e| ConfigError::io("替换设置文件", path, e))?;
+    // 改名成功，临时文件已经不在原路径上了，撤掉守卫免得误删刚写好的设置。
+    guard.disarm();
+
+    // 顺带把目录项也刷一次，让这次改名在掉电后仍然可见。这一步是尽力而为：
+    // 它失败不代表数据有问题（新内容已经完整落盘、改名对其他读者也已生效），
+    // 为此让 save 整个报错反而会误导用户去做无谓的补救。
+    if let Ok(handle) = File::open(dir) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
+}
+
+/// Unix 上把配置目录与设置文件收紧到当前用户可读写。
+///
+/// Bark 地址里含设备密钥，不能依赖系统 umask 恰好足够严格。Windows 的用户配置
+/// 目录由 ACL 保护，因此这里不额外改动。
+#[cfg(unix)]
+fn harden_config_dir(dir: &Path) -> Result<(), ConfigError> {
+    // 裸文件名会退回当前目录，测试或嵌入方不应因此被修改整个工作目录权限。
+    if dir == Path::new(".") {
+        return Ok(());
+    }
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|source| ConfigError::io("收紧配置目录权限", dir, source))
+}
+
+#[cfg(not(unix))]
+fn harden_config_dir(_dir: &Path) -> Result<(), ConfigError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_existing_config(path: &Path) -> Result<(), ConfigError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            harden_config_dir(parent_dir(path))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|source| ConfigError::io("收紧设置文件权限", path, source))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(ConfigError::io("检查设置文件权限", path, source)),
+    }
+}
+
+#[cfg(not(unix))]
+fn harden_existing_config(_path: &Path) -> Result<(), ConfigError> {
+    Ok(())
+}
+
+// ---- Go 版设置的读取结构。
+// ---- 单独写一套而不是给 Settings 加别名：两版字段命名规则整体不同
+// ---- （snake_case vs camelCase），用 alias 打补丁会让新版的线上格式变得含糊，
+// ---- 而那个格式是前端 TypeScript 类型照着写的，必须保持唯一。
+
+#[derive(Debug, Deserialize)]
+struct LegacySettings {
+    #[serde(default)]
+    locale: Option<String>,
+    #[serde(default)]
+    targets: Vec<LegacyTarget>,
+    /// Go 版这个字段是有符号 `int`，磁盘上完全可能是 0 甚至负数。
+    /// 直接按 `u64` 接会让整份迁移因为一个字段而失败，所以先用 `i64` 接住，
+    /// 越界的值交给 [`Settings::normalize`] 收敛。
+    #[serde(default)]
+    interval_seconds: Option<i64>,
+    #[serde(default)]
+    bark_url: Option<String>,
+    #[serde(default)]
+    sound_enabled: Option<bool>,
+    #[serde(default)]
+    open_bag_on_hit: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyTarget {
+    #[serde(default)]
+    locale: String,
+    #[serde(default)]
+    store_number: String,
+    #[serde(default)]
+    store_title: String,
+    #[serde(default)]
+    part_number: String,
+    #[serde(default)]
+    product_name: String,
+}
+
+impl LegacyTarget {
+    fn into_target(self) -> Target {
+        Target {
+            locale: self.locale,
+            store_number: self.store_number,
+            store_title: self.store_title,
+            part_number: self.part_number,
+            product_name: self.product_name,
+            companion_part: None,
+            companion_name: None,
+            kit_part: None,
+            pickup_location: None,
+        }
+    }
+}
+
+impl LegacySettings {
+    fn into_settings(self) -> Settings {
+        let fallback = Settings::default();
+        // 缺失的字段取新版默认值，而不是取零值：Go 版的 SoundEnabled 默认为 true，
+        // 一个缺字段的老文件不该在迁移途中把用户的提示音悄悄关掉。
+        let mut settings = Settings {
+            locale: self.locale.unwrap_or(fallback.locale),
+            targets: self
+                .targets
+                .into_iter()
+                .map(LegacyTarget::into_target)
+                .collect(),
+            delivery_region: None,
+            interval_seconds: self
+                .interval_seconds
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(fallback.interval_seconds),
+            bark_url: self.bark_url.unwrap_or(fallback.bark_url),
+            product_bark_urls: BTreeMap::new(),
+            sound_enabled: self.sound_enabled.unwrap_or(fallback.sound_enabled),
+            open_on_hit: match self.open_bag_on_hit {
+                Some(true) => OpenOnHit::Bag,
+                Some(false) => OpenOnHit::None,
+                None => fallback.open_on_hit,
+            },
+            stop_on_hit: fallback.stop_on_hit,
+            network: fallback.network,
+            checkout: fallback.checkout,
+        };
+        settings.normalize();
+        settings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn 目标(store: &str, part: &str) -> Target {
+        Target {
+            locale: "zh_CN".into(),
+            store_number: store.into(),
+            store_title: "上海-环球港".into(),
+            part_number: part.into(),
+            product_name: "iPhone 17 512GB 黑色".into(),
+            companion_part: None,
+            companion_name: None,
+            kit_part: None,
+            pickup_location: None,
+        }
+    }
+
+    #[test]
+    fn 默认设置本身就是规范化的() {
+        let mut s = Settings::default();
+        let before = s.clone();
+        s.normalize();
+        // 默认值再规范化一次必须原地不动，否则「默认」和「合法」就是两回事，
+        // 存取往返会莫名其妙地改内容。
+        assert_eq!(before, s);
+        assert_eq!(s.interval_seconds, DEFAULT_INTERVAL_SECONDS);
+        assert!(s.sound_enabled);
+        assert_eq!(s.open_on_hit, OpenOnHit::Bag);
+        assert!(region_by_locale(&s.locale).is_some());
+    }
+
+    #[test]
+    fn 规范化修正非法地区() {
+        let mut s = Settings {
+            locale: "de_DE".into(),
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.locale, fallback_locale());
+
+        // 合法地区不能被动。
+        let mut ok = Settings {
+            locale: "ja_JP".into(),
+            ..Settings::default()
+        };
+        ok.normalize();
+        assert_eq!(ok.locale, "ja_JP");
+    }
+
+    #[test]
+    fn 规范化把过小的间隔退回默认值() {
+        for bad in [0, 1, MIN_INTERVAL_SECONDS - 1] {
+            let mut s = Settings {
+                interval_seconds: bad,
+                ..Settings::default()
+            };
+            s.normalize();
+            assert_eq!(
+                s.interval_seconds, DEFAULT_INTERVAL_SECONDS,
+                "间隔 {bad} 秒应当退回默认值"
+            );
+        }
+
+        // 下限本身是允许的，用户有意调快的余地要留着。
+        let mut s = Settings {
+            interval_seconds: MIN_INTERVAL_SECONDS,
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.interval_seconds, MIN_INTERVAL_SECONDS);
+        assert_eq!(s.interval(), Duration::from_secs(MIN_INTERVAL_SECONDS));
+    }
+
+    #[test]
+    fn 规范化去重并保留首次出现的顺序() {
+        let mut s = Settings {
+            targets: vec![
+                目标("R683", "MG724CH/A"),
+                目标("R448", "MG0A4CH/A"),
+                目标("R683", "MG724CH/A"),
+            ],
+            ..Settings::default()
+        };
+        s.normalize();
+        assert_eq!(s.targets.len(), 2);
+        assert_eq!(s.targets[0].store_number, "R683");
+        assert_eq!(s.targets[1].store_number, "R448");
+    }
+
+    #[test]
+    fn 规范化丢掉发不出请求的目标() {
+        let mut s = Settings {
+            targets: vec![
+                目标("", "MG724CH/A"),
+                目标("R683", ""),
+                目标("R683", "   "),
+                Target {
+                    locale: String::new(),
+                    ..目标("R448", "MG0A4CH/A")
+                },
+                目标("R683", "MG724CH/A"),
+            ],
+            ..Settings::default()
+        };
+        s.normalize();
+        // 只剩那条字段齐全的。地区/门店/零件号任缺其一都发不出请求，留着只会在
+        // 界面上永远显示「未知」，让用户以为是程序坏了。
+        assert_eq!(s.targets, vec![目标("R683", "MG724CH/A")]);
+    }
+
+    #[test]
+    fn 规范化是幂等的() {
+        let mut once = Settings {
+            locale: "de_DE".into(),
+            interval_seconds: 1,
+            targets: vec![目标("R683", "MG724CH/A"), 目标("R683", "MG724CH/A")],
+            ..Settings::default()
+        };
+        once.normalize();
+        let mut twice = once.clone();
+        twice.normalize();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn 限量读取不会把整个文件吃进内存() {
+        // std::io::repeat 是一个无限长的读取源。如果实现是「先整读再判断大小」，
+        // 这个用例会一直分配内存直到进程被杀 —— 它跑得完，本身就是证明。
+        // 这正是 Go 版 os.ReadFile 缺的那一环。
+        let got = read_capped(std::io::repeat(b'x'), MAX_SETTINGS_BYTES).expect("读取不该失败");
+        assert!(got.is_none(), "无限长的内容必须被判为超限");
+    }
+
+    #[test]
+    fn 限量读取的边界正好落在上限上() {
+        let exact = vec![b'x'; MAX_SETTINGS_BYTES];
+        let got = read_capped(exact.as_slice(), MAX_SETTINGS_BYTES).expect("读取不该失败");
+        assert_eq!(got.map(|v| v.len()), Some(MAX_SETTINGS_BYTES));
+
+        let over = vec![b'x'; MAX_SETTINGS_BYTES + 1];
+        let got = read_capped(over.as_slice(), MAX_SETTINGS_BYTES).expect("读取不该失败");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn 裸文件名的父目录是当前目录() {
+        assert_eq!(parent_dir(Path::new("settings.v2.json")), Path::new("."));
+        assert_eq!(
+            parent_dir(Path::new("/a/b/settings.v2.json")),
+            Path::new("/a/b")
+        );
+    }
+
+    #[test]
+    fn 旧版负数间隔会被收敛掉而不是让整份迁移失败() {
+        let legacy: LegacySettings =
+            serde_json::from_str(r#"{"locale":"zh_CN","interval_seconds":-1}"#)
+                .expect("旧版的有符号间隔必须能解析");
+        let s = legacy.into_settings();
+        assert_eq!(s.interval_seconds, DEFAULT_INTERVAL_SECONDS);
+    }
+
+    #[test]
+    fn 旧版缺失的开关取默认值而不是取假() {
+        let legacy: LegacySettings =
+            serde_json::from_str(r#"{"locale":"zh_CN"}"#).expect("缺字段的旧文件也要能解析");
+        let s = legacy.into_settings();
+        // Go 版 Default() 里这两项都是 true。缺字段当成 false 会让用户在完全
+        // 没动过设置的情况下，升级之后提示音自己关掉了。
+        assert!(s.sound_enabled);
+        assert_eq!(s.open_on_hit, OpenOnHit::Bag);
+    }
+
+    #[test]
+    fn 定位配置目录时不碰磁盘() {
+        // new() 只算路径。构造一个 Store 就在用户机器上建目录，会让「装了但从没
+        // 用过」也留下痕迹；目录该在真正写盘时才出现。
+        let Ok(store) = SettingsStore::new() else {
+            return; // 没有配置目录的环境跳过，这不是本用例要验证的事。
+        };
+        assert!(
+            store
+                .path()
+                .ends_with(Path::new(APP_DIR).join(SETTINGS_FILE))
+        );
+        // 新版必须和 Go 版分家，否则两个版本会互相覆盖对方的配置。
+        assert_ne!(SETTINGS_FILE, LEGACY_SETTINGS_FILE);
+    }
+}

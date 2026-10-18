@@ -1,0 +1,31 @@
+name: Build private SOCKS5 Windows EXE
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Test and build unsigned Windows installer
+        shell: pwsh
+        run: ./build-windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: socks5-windows-x64
+          if-no-files-found: error
+          path: |
+            target/release/bundle/nsis/*-setup.exe
+            target/release/apple-store-inventory-monitor.exe
