@@ -1,4 +1,4 @@
-> SOCKS5 定制源码版本，尚未在 Windows 编译验收。行为及验证状态以 [SOCKS5-CHANGES.md](SOCKS5-CHANGES.md) 为准。
+> SOCKS5 定制版本已通过 Windows 云端编译与自动测试；真实代理和 Windows 界面仍待人工验收。构建记录见 [SOCKS5-CHANGES.md](SOCKS5-CHANGES.md)。
 
 # 果到雷达
 

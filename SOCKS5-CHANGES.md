@@ -1,6 +1,6 @@
 # 果到雷达 SOCKS5 定制源码
 
-本包是可审阅、可继续构建的源码修改，**不是已验收的 Windows EXE**。
+本包已在 GitHub Actions Windows x64 环境通过测试并生成 NSIS 安装 EXE。尚未进行真实代理和 Windows 界面人工验收。
 
 ## 核验来源
 
@@ -27,14 +27,19 @@
 
 ## 已完成的验证与限制
 
-- TypeScript 类型检查：通过。
-- 前端生产构建 `pnpm build`：通过。Vite 配置改用标准 ESM URL 路径，使用 runner 配置加载器。
-- 前端测试：55 项通过，其中新增 3 项导入测试。
-- `cargo fmt --all --check`：通过；只能证明 Rust 源码可格式化，不能替代编译。
-- 已增加 SOCKS 认证、远程 DNS、故障备用、凭据落盘和退避测试；更新了原来“拒绝后换 IP”的测试预期。**Rust 测试尚未运行通过**。
-- `cargo check --workspace`：在编译依赖构建脚本时失败。当前 Mac 缺少 Xcode Command Line Tools，`cc` 链接器提示 `No developer tools were found`；尚未完成应用 Rust 代码的类型检查。
-- 未提供真实代理凭据，未做真实代理/Apple 库存联网验收，未运行 Windows GUI，未生成或验收 EXE。
-- Rust 编译和 Windows 验收仍是交付给最终使用者前的必做步骤；本包不应当被当成已经验证可运行的安装包。
+2026-10-18 云端构建成功：
+
+- 仓库：https://github.com/hn986333-a11y/qiangshouji
+- 已测试源码提交：`73a99ae50fee5f412f4cdaf76a2f8b0b0b90de05`
+- 构建记录：https://github.com/hn986333-a11y/qiangshouji/actions/runs/39109114101
+- Windows 前端测试：55 项通过。
+- Windows Rust 测试：324 项通过，23 项需要真实网络、浏览器或专用环境的测试按原设置跳过。
+- Rust 格式检查、TypeScript 类型检查、前端生产构建：通过。
+- Windows release 编译、NSIS 安装包生成、产物上传：通过。
+- 安装包原始文件名：`果到雷达_1.0.22_x64-setup.exe`，未签名。
+- Artifact：`socks5-windows-x64`，包含安装 EXE 和应用 EXE。
+- 当前 Mac 最初因缺少 Xcode Command Line Tools 无法编译，最终由 Windows 云端完成验证。
+- 未提供真实代理凭据，未做真实代理/Apple 库存联网验收，未运行 Windows GUI 人工验收；编译成功不代表上述场景已验收。
 
 ## 在 Windows x64 构建
 
@@ -61,7 +66,7 @@ pnpm tauri build --bundles nsis
 
 ## 使用 GitHub Actions 构建
 
-把源码放入你自己的 GitHub 仓库并提交全部修改后，在 Actions 中手动运行 **Build private SOCKS5 Windows EXE**。流程位于 `.github/workflows/windows-socks5.yml`，先测试再构建，通过后下载名为 `socks5-windows-x64` 的 artifact。流程不会发布 Release。本次没有上传到任何仓库，也没有触发云端构建。
+本次已完成上传和云端构建。后续向 main 提交会自动构建，也可以在 Actions 中手动运行 **Build private SOCKS5 Windows EXE**。流程位于 `.github/workflows/windows-socks5.yml`，先测试再构建，通过后下载名为 `socks5-windows-x64` 的 artifact。流程不会发布 Release。产物保存在构建记录的 Artifacts 中，不会自动创建 Release。
 
 ## Windows 验收
 
