@@ -612,7 +612,8 @@ fn 设置的线上格式是小驼峰() {
                 "proxyPort": 7899,
                 "nodeFilter": "香港|日本",
                 "pinnedNode": "DIRECT"
-            }
+            },
+            "socks5": { "nodes": [], "selected": 0, "failover": false }
         }))
     );
 }
