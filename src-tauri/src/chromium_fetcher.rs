@@ -5028,27 +5028,27 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn 首次查询节点列表未加载时也能连续换多个节点() {
-        let (clash, _log) = fake_clash(&["香港01", "日本01", "新加坡01"], "香港01").await;
-        let (fetcher, _peer) = cdp_responses(vec![
-            http_response(541),
-            navigate_response(),
-            ready_response(),
-            http_response(541),
-            navigate_response(),
-            ready_response(),
-            pickup_response(&["R390"], "MG6X4CH/A", "unavailable"),
-        ])
-        .await;
+    async fn 首次查询尚未加载节点时被拒也不会换出口() {
+        let (clash, log) = fake_clash(&["香港01", "日本01", "新加坡01"], "香港01").await;
+        let (fetcher, _peer) = cdp_responses(vec![http_response(541)]).await;
         use_clash(&fetcher, clash).await;
         assert!(fetcher.state.lock().await.routes.routes().is_empty());
         let region = region_by_locale("zh_CN").unwrap();
-
         fetcher.begin_cycle().await;
-        fetcher
+        let result = fetcher
             .pickup_message(region, "R390", &[test_target("MG6X4CH/A")], None)
-            .await
-            .expect("连续两个节点被拒后第三个节点应能拿到结果");
-        assert_eq!(fetcher.state.lock().await.routes.active(), Some("新加坡01"));
+            .await;
+        assert!(matches!(result, Err(ApiError::Blocked(_))));
+        let state = fetcher.state.lock().await;
+        assert_eq!(state.routes.active(), Some("香港01"));
+        assert!(state.check_backoff().is_err());
+        assert_eq!(state.gate.cycle_request_count, 1);
+        drop(state);
+        assert!(
+            log.lock()
+                .await
+                .iter()
+                .all(|entry| !entry.starts_with("PUT"))
+        );
     }
 }
