@@ -1,6 +1,8 @@
 name: Build private SOCKS5 Windows EXE
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 permissions:
   contents: read
 jobs:
